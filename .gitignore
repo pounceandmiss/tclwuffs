@@ -1,0 +1,7 @@
+# Build outputs
+build/
+libtclwuffs*.so
+libtclwuffs*.a
+libtkwuffs*.so
+libtkwuffs*.a
+pkgIndex.tcl
