@@ -39,8 +39,18 @@ Each tier produces both a shared library and a static archive:
 | `libtclwuffs<VER>.so`       | `package require tclwuffs` (Tcl `load`)  |
 | `libtclwuffs<VER>.a`        | Static link into a Tcl-embedding host    |
 | `libtkwuffs<VER>.so`        | `package require tkwuffs`                |
-| `libtkwuffs<VER>.a`         | Static link                              |
+| `libtkwuffs<VER>.a`         | Static link — extends `libtclwuffs.a`    |
 | `pkgIndex.tcl`              | Tcl package index for both               |
+
+`libtkwuffs.a` contains only the Tk-binding objects (no wuffs/stb glue), so
+static consumers always link it alongside `libtclwuffs.a`:
+
+```
+-ltkwuffs -ltclwuffs   # order matters with single-pass linkers
+```
+
+The `.so` flavors are self-contained as usual; only the static archives
+follow the extends-not-duplicates rule.
 
 ## API reference
 

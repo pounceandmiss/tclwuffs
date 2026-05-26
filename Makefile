@@ -138,7 +138,10 @@ $(LIB_TCL_A): $(STATIC_SHARED_O) $(STATIC_TCL_O)
 $(LIB_TK_SO): $(PIC_SHARED_O) $(PIC_TK_O)
 	$(CC) $(SO_FLAGS) -o $@ $^ $(TCL_STUB_LIB) $(TK_STUB_LIB) $(LDLIBS_BASE)
 
-$(LIB_TK_A): $(STATIC_SHARED_O) $(STATIC_TK_O)
+# libtkwuffs.a strictly extends libtclwuffs.a — shared glue lives only in
+# libtclwuffs.a, so static consumers link both (-ltkwuffs -ltclwuffs) with no
+# duplicate symbols.
+$(LIB_TK_A): $(STATIC_TK_O)
 	$(AR) rcs $@ $^
 
 # ---- pkgIndex.tcl ---------------------------------------------------------
