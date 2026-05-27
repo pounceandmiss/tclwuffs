@@ -232,5 +232,5 @@ install: all
 	$(INSTALL) -d $(INSTALL_DIR)
 	$(INSTALL) -m 0644 $(LIB_TCL_SO) $(PKGINDEX) $(INSTALL_DIR)/
 ifeq ($(HAVE_TK),1)
-	$(INSTALL) -m 0644 $(LIB_TK_SO) $(INSTALL_DIR)/
+	$(INSTALL) -m 0644 $(LIB_TK_SO) tkwuffs_animate.tcl $(INSTALL_DIR)/
 endif

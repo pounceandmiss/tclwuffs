@@ -12,6 +12,8 @@ Two packages:
 - **`tclwuffs`** — works in plain `tclsh`. Pure bytes-in / bytes-out.
 - **`tkwuffs`** — adds a Tk `photo` image bridge. Requires Tk.
 
+![example_animate](example_animate.gif)
+
 ## Build
 
 Vendored sources are committed under `vendor/`. To rebuild from clean:
@@ -79,6 +81,34 @@ top-down rows). Returns a dict:
 Supported decoders: PNG, JPEG, GIF, BMP, WebP (lossless only — lossy
 VP8 will work automatically once google/wuffs PR #168 lands and the
 pinned commit is bumped).
+
+For animated inputs, `decode` only returns the first frame. Use the
+`decoder` handle (below) to stream every frame plus timing.
+
+#### `::tclwuffs::decoder $bytes`
+
+Opens a streaming multi-frame decoder. Returns a handle command:
+
+| Subcommand    | Returns                                                |
+|---------------|--------------------------------------------------------|
+| `$h info`     | dict `{width W height H loop_count L}`                 |
+| `$h next`     | dict `{pixels P delay_ms D}` per frame, or `""` at end |
+| `$h restart`  | rewind so the next `next` returns frame 0 again        |
+| `$h destroy`  | free the decoder                                       |
+
+Pixels are `width*height*4` RGBA straight-alpha, fully composed (GIF
+disposal and per-frame blend are resolved internally). Sub-20ms delays
+are bumped to 100ms. `loop_count 0` means loop forever (GIF default).
+Single-frame inputs return one frame then `""`. `$bytes` is copied
+internally; the caller can free it after the call.
+
+```tcl
+set h [::tclwuffs::decoder $bytes]
+while {[set f [$h next]] ne ""} {
+    # ...process [dict get $f pixels]...
+}
+$h destroy
+```
 
 #### `::tclwuffs::encode_png $w $h $pixels`
 
@@ -159,6 +189,60 @@ image create photo small
 
 Reads pixels from `$src`, crops to the rectangle (`$x`,`$y`,`$w`,`$h`),
 writes to `$dst`.
+
+### Animation
+
+`animation` binds an animation to a Tk photo; `play`/`pause`/`restart`
+control playback by photo name. State lives on the photo: deleting the
+photo (`image delete p`, `rename p ""`) tears the animation down via a
+command-delete trace. The photo itself is plain Tk: pass it to widgets
+via `-image`, call `p put` / `p cget` as usual.
+
+#### `::tkwuffs::animation $photoName -data $bytes | -file $path \`
+####                                  `?-cache lazy|eager? ?-loops N? ?-onstop CMD?`
+
+Creates the animation. Exactly one of `-data` or `-file` is required.
+Creates the photo if missing. Does NOT auto-start; frame 0 is rendered
+on the first `play`. Returns `$photoName`. Re-calling on an
+already-animated photo replaces the source/opts (old decoder and
+eager-mode frame photos are reclaimed).
+
+- `-cache lazy` (default) decodes one frame per tick from a kept-alive
+  `::tclwuffs::decoder`. Steady-state memory ~3x one frame; per-tick
+  cost is one wuffs frame decode (sub-ms for GIF). Right default for
+  anything more than a few MB of raw RGBA.
+- `-cache eager` pre-renders every frame into a private Tk photo;
+  each tick is `$photo copy`. Holds `N*W*H*4` bytes. Worth it for many
+  small parallel animations where decode CPU stacks up.
+- `-loops N` overrides the source loop count. `0` = forever.
+- `-onstop CMD` runs at global scope when the loop cap is reached.
+  Not fired by `pause`, `restart`, or photo deletion.
+
+```tcl
+package require tkwuffs
+::tkwuffs::animation p -file holiday.gif
+pack [label .l -image p]
+::tkwuffs::play p
+```
+
+#### `::tkwuffs::play $photoName`
+
+Start or resume. No-op if already playing or if the loop cap has been
+reached (call `restart` to play again).
+
+#### `::tkwuffs::pause $photoName`
+
+Cancel pending ticks. Current frame remains displayed.
+
+#### `::tkwuffs::restart $photoName`
+
+Rewind to frame 0. Play/pause state is preserved.
+
+#### `::tkwuffs::info $photoName`
+
+Dict: `target`, `mode` (`lazy`/`eager`), `width`, `height`, `iter`,
+`loops`, `playing`. Eager mode also: `frame_count`, `index`. Raises
+`INVALID_INPUT` if the photo has no animation.
 
 ## Errors
 

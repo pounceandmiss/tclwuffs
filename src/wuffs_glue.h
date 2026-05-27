@@ -17,6 +17,7 @@ extern "C" {
  * Tcl -errorcode {TCLWUFFS <CATEGORY> ...} taxonomy. */
 enum {
     TCW_OK                  =  0,
+    TCW_END                 =  1,   /* end-of-stream signal (decoder_next) */
     TCW_ERR_INVALID_INPUT   = -1,   /* INVALID_INPUT */
     TCW_ERR_OOM             = -2,   /* OOM */
     TCW_ERR_UNSUPPORTED_FMT = -3,   /* UNSUPPORTED_FORMAT */
@@ -49,6 +50,27 @@ int tcw_decode(const uint8_t* bytes, size_t len,
  * before the photo gets sized. */
 int tcw_dims(const uint8_t* bytes, size_t len,
              uint32_t* out_w, uint32_t* out_h, tcw_err* err);
+
+/* Streaming multi-frame decoder. Opaque handle keeps the wuffs decoder,
+ * a copy of the source bytes, composed canvas, and disposal state alive
+ * across calls. Single-frame inputs work too: one frame then TCW_END. */
+typedef struct tcw_decoder tcw_decoder;
+
+int      tcw_decoder_open(const uint8_t* bytes, size_t len,
+                          tcw_decoder** out, tcw_err* err);
+
+uint32_t tcw_decoder_width(const tcw_decoder*);
+uint32_t tcw_decoder_height(const tcw_decoder*);
+uint32_t tcw_decoder_loop_count(const tcw_decoder*);
+
+/* *out_pixels aliases the decoder's internal canvas (w*h*4 RGBA, valid
+ * only until the next next/restart/close call; the same buffer is
+ * mutated in place). Returns TCW_OK, TCW_END, or a TCW_ERR_*. */
+int tcw_decoder_next(tcw_decoder*, const uint8_t** out_pixels,
+                     uint32_t* out_delay_ms, tcw_err* err);
+
+int  tcw_decoder_restart(tcw_decoder*, tcw_err* err);
+void tcw_decoder_close(tcw_decoder*);
 
 /* Encode RGBA pixels (straight alpha) to PNG bytes. Uses stb_image_write,
  * which emits a normally zlib-deflated PNG. */

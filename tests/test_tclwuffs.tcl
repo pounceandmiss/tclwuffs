@@ -2,7 +2,7 @@
 
 set here [file dirname [info script]]
 set root [file dirname $here]
-lappend auto_path $root
+set auto_path [linsert $auto_path 0 $root]
 package require tclwuffs
 
 set fixture [file join $here bricks-color.png]
@@ -112,6 +112,66 @@ check "encode_png error category INVALID_INPUT" \
 
 set rc [catch {::tclwuffs::crop_bytes $bytes 0 0 10000 10000} msg]
 check "crop out-of-bounds raises" {$rc != 0}
+
+# decoder handle on a still PNG: info, one frame, then end-of-stream.
+set dec [::tclwuffs::decoder $bytes]
+set meta [$dec info]
+check "decoder info has width"       {[dict get $meta width] == $w}
+check "decoder info has loop_count"  {[dict exists $meta loop_count]}
+set f0 [$dec next]
+check "decoder first frame returned" {$f0 ne ""}
+check "decoder pixels match decode"  {[dict get $f0 pixels] eq $pix}
+check "decoder has delay_ms"         {[dict exists $f0 delay_ms]}
+check "decoder end after one frame"  {[$dec next] eq ""}
+# Idempotent end: subsequent calls keep returning empty.
+check "decoder end is sticky"        {[$dec next] eq ""}
+$dec restart
+set f0b [$dec next]
+check "decoder restart returns frame 0 again" \
+    {$f0b ne "" && [dict get $f0b pixels] eq $pix}
+$dec destroy
+check "destroy removes the command"  {[llength [info commands $dec]] == 0}
+
+# decoder handle on an animated GIF: many frames, plausible delays.
+set gif_path [file join $here Stirling_Animation.gif]
+if {[file exists $gif_path]} {
+    set gfp [open $gif_path rb]; set gbytes [read $gfp]; close $gfp
+    set dec [::tclwuffs::decoder $gbytes]
+    set meta [$dec info]
+    set gw [dict get $meta width]
+    set gh [dict get $meta height]
+    set count   0
+    set bad_size  0
+    set bad_delay 0
+    while {[set f [$dec next]] ne ""} {
+        incr count
+        if {[string length [dict get $f pixels]] != $gw*$gh*4} {
+            incr bad_size
+        }
+        if {[dict get $f delay_ms] < 20} { incr bad_delay }
+    }
+    check "GIF decoder yields multiple frames" {$count > 1}
+    check "GIF frame pixels sized to W*H*4"    {$bad_size == 0}
+    check "GIF delays all >= clamp floor"      {$bad_delay == 0}
+    # Restart and confirm the same count.
+    $dec restart
+    set count2 0
+    while {[$dec next] ne ""} { incr count2 }
+    check "GIF restart yields same frame count" {$count2 == $count}
+    $dec destroy
+}
+
+# Bad input: invalid bytes raise.
+set rc [catch {::tclwuffs::decoder "not an image"} msg]
+check "decoder on garbage raises" {$rc != 0}
+check "decoder error is UNSUPPORTED_FORMAT" \
+    {[lindex $::errorCode 1] eq "UNSUPPORTED_FORMAT"}
+
+# Subcommand sanity.
+set dec [::tclwuffs::decoder $bytes]
+set rc [catch {$dec bogus} msg]
+check "decoder bogus subcommand raises" {$rc != 0}
+$dec destroy
 
 if {$fails == 0} {
     puts "ALL tclwuffs TESTS PASSED"

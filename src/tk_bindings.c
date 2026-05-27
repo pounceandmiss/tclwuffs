@@ -81,6 +81,38 @@ static int decode_to_photo_cmd(void* cd, Tcl_Interp* interp,
     return tk_rc;
 }
 
+/* ::tkwuffs::put_rgba $photoName $w $h $pixels
+ *
+ * Writes a raw RGBA buffer (straight alpha, w*h*4 bytes) into the named
+ * photo, resizing it to match. Bypasses any encode/decode round-trip. */
+
+static int put_rgba_cmd(void* cd, Tcl_Interp* interp,
+                        int objc, Tcl_Obj* const objv[]) {
+    (void)cd;
+    if (objc != 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "photoName w h pixels");
+        return TCL_ERROR;
+    }
+    Tk_PhotoHandle h = resolve_photo(interp, objv[1]);
+    if (!h) return TCL_ERROR;
+
+    int w_i, h_i;
+    if (Tcl_GetIntFromObj(interp, objv[2], &w_i) != TCL_OK) return TCL_ERROR;
+    if (Tcl_GetIntFromObj(interp, objv[3], &h_i) != TCL_OK) return TCL_ERROR;
+    if (w_i <= 0 || h_i <= 0)
+        return tcw_raise_invalid(interp, "width and height must be positive");
+
+    Tcl_Size pix_len = 0;
+    const unsigned char* pix = Tcl_GetByteArrayFromObj(objv[4], &pix_len);
+    size_t need = (size_t)w_i * (size_t)h_i * 4u;
+    if ((size_t)pix_len != need)
+        return tcw_raise_invalid(interp,
+            "pixels length %lld does not match %dx%d*4 = %zu",
+            (long long)pix_len, w_i, h_i, need);
+
+    return put_rgba_into_photo(interp, h, (uint32_t)w_i, (uint32_t)h_i, pix);
+}
+
 /* ::tkwuffs::encode_png_from_photo $photoName */
 
 static int encode_png_from_photo_cmd(void* cd, Tcl_Interp* interp,
@@ -224,6 +256,8 @@ DLLEXPORT int Tkwuffs_Init(Tcl_Interp* interp) {
     Tcl_CreateNamespace(interp, "::tkwuffs", NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tkwuffs::decode_to_photo",
                          decode_to_photo_cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::tkwuffs::put_rgba",
+                         put_rgba_cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tkwuffs::encode_png_from_photo",
                          encode_png_from_photo_cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tkwuffs::resize_photo",

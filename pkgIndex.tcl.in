@@ -3,6 +3,7 @@ package ifneeded tclwuffs @VERSION@ \
     [list load [file join $dir libtclwuffs@VERSION@$_ext] Tclwuffs]
 if {[file exists [file join $dir libtkwuffs@VERSION@$_ext]]} {
     package ifneeded tkwuffs @VERSION@ \
-        [list load [file join $dir libtkwuffs@VERSION@$_ext] Tkwuffs]
+        "[list load [file join $dir libtkwuffs@VERSION@$_ext] Tkwuffs]
+[list source [file join $dir tkwuffs_animate.tcl]]"
 }
 unset _ext

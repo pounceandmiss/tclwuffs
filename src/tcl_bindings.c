@@ -53,6 +53,112 @@ static int decode_cmd(void* cd, Tcl_Interp* interp,
     return TCL_OK;
 }
 
+/* ::tclwuffs::decoder $bytes: returns a handle command supporting
+ * info / next / restart / destroy. See README. */
+
+static void dec_delete_proc(void* cd) {
+    tcw_decoder* dec = (tcw_decoder*)cd;
+    tcw_decoder_close(dec);
+}
+
+static int dec_handle_cmd(void* cd, Tcl_Interp* interp,
+                          int objc, Tcl_Obj* const objv[]) {
+    tcw_decoder* dec = (tcw_decoder*)cd;
+    if (objc < 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "subcommand ?args?");
+        return TCL_ERROR;
+    }
+    const char* sub = Tcl_GetString(objv[1]);
+
+    if (strcmp(sub, "info") == 0) {
+        if (objc != 2) {
+            Tcl_WrongNumArgs(interp, 2, objv, "");
+            return TCL_ERROR;
+        }
+        Tcl_Obj* d = Tcl_NewDictObj();
+        Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("width", -1),
+                       Tcl_NewWideIntObj(tcw_decoder_width(dec)));
+        Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("height", -1),
+                       Tcl_NewWideIntObj(tcw_decoder_height(dec)));
+        Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("loop_count", -1),
+                       Tcl_NewWideIntObj(tcw_decoder_loop_count(dec)));
+        Tcl_SetObjResult(interp, d);
+        return TCL_OK;
+    }
+
+    if (strcmp(sub, "next") == 0) {
+        if (objc != 2) {
+            Tcl_WrongNumArgs(interp, 2, objv, "");
+            return TCL_ERROR;
+        }
+        const uint8_t* pix = NULL;
+        uint32_t delay_ms = 0;
+        tcw_err err = {0};
+        int rc = tcw_decoder_next(dec, &pix, &delay_ms, &err);
+        if (rc == TCW_END) {
+            Tcl_ResetResult(interp);
+            return TCL_OK;
+        }
+        if (rc != TCW_OK) return tcw_raise(interp, &err);
+        Tcl_Obj* d = Tcl_NewDictObj();
+        Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("pixels", -1),
+                       Tcl_NewByteArrayObj(pix,
+                           (Tcl_Size)((size_t)tcw_decoder_width(dec)
+                                      * tcw_decoder_height(dec) * 4u)));
+        Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("delay_ms", -1),
+                       Tcl_NewWideIntObj(delay_ms));
+        Tcl_SetObjResult(interp, d);
+        return TCL_OK;
+    }
+
+    if (strcmp(sub, "restart") == 0) {
+        if (objc != 2) {
+            Tcl_WrongNumArgs(interp, 2, objv, "");
+            return TCL_ERROR;
+        }
+        tcw_err err = {0};
+        if (tcw_decoder_restart(dec, &err) != TCW_OK)
+            return tcw_raise(interp, &err);
+        return TCL_OK;
+    }
+
+    if (strcmp(sub, "destroy") == 0) {
+        if (objc != 2) {
+            Tcl_WrongNumArgs(interp, 2, objv, "");
+            return TCL_ERROR;
+        }
+        /* Fires dec_delete_proc which closes the C decoder. */
+        Tcl_DeleteCommand(interp, Tcl_GetString(objv[0]));
+        return TCL_OK;
+    }
+
+    return tcw_raise_invalid(interp,
+        "unknown subcommand \"%s\": must be info, next, restart, or destroy", sub);
+}
+
+static int decoder_cmd(void* cd, Tcl_Interp* interp,
+                       int objc, Tcl_Obj* const objv[]) {
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "bytes");
+        return TCL_ERROR;
+    }
+    Tcl_Size len = 0;
+    const unsigned char* bytes = Tcl_GetByteArrayFromObj(objv[1], &len);
+
+    tcw_decoder* dec = NULL;
+    tcw_err err = {0};
+    int rc = tcw_decoder_open(bytes, (size_t)len, &dec, &err);
+    if (rc != TCW_OK) return tcw_raise(interp, &err);
+
+    static int seq = 0;
+    char name[64];
+    snprintf(name, sizeof name, "::tclwuffs::dec%d", seq++);
+    Tcl_CreateObjCommand(interp, name, dec_handle_cmd, dec, dec_delete_proc);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(name, -1));
+    return TCL_OK;
+}
+
 /* ::tclwuffs::encode_png $w $h $pixels */
 
 static int encode_png_cmd(void* cd, Tcl_Interp* interp,
@@ -246,6 +352,7 @@ DLLEXPORT int Tclwuffs_Init(Tcl_Interp* interp) {
     Tcl_CreateNamespace(interp, "::tclwuffs", NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tclwuffs::sniff",        sniff_cmd,        NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tclwuffs::decode",       decode_cmd,       NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::tclwuffs::decoder",      decoder_cmd,      NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tclwuffs::encode_png",   encode_png_cmd,   NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tclwuffs::encode_jpeg",  encode_jpeg_cmd,  NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tclwuffs::resize_bytes", resize_bytes_cmd, NULL, NULL);

@@ -251,6 +251,296 @@ int tcw_dims(const uint8_t* bytes, size_t len,
     return rc;
 }
 
+/* public: streaming multi-frame decoder */
+
+/* Browsers bump sub-20ms GIF delays to ~100ms (treating them as authoring
+ * mistakes); we match so a 0-delay frame can't spin Tk's event loop. */
+#define TCW_MIN_FRAME_DELAY_MS  20
+#define TCW_BUMP_FRAME_DELAY_MS 100
+#define TCW_MAX_FRAME_DELAY_MS  (UINT32_MAX / 2)
+
+static uint32_t flicks_to_ms_clamped(uint64_t flicks) {
+    uint64_t ms = flicks / WUFFS_BASE__FLICKS_PER_MILLISECOND;
+    if (ms < TCW_MIN_FRAME_DELAY_MS) return TCW_BUMP_FRAME_DELAY_MS;
+    if (ms > TCW_MAX_FRAME_DELAY_MS) return TCW_MAX_FRAME_DELAY_MS;
+    return (uint32_t)ms;
+}
+
+/* Clear a sub-rectangle to transparent black. Clips silently. */
+static void canvas_clear_rect(uint8_t* canvas, uint32_t cw, uint32_t ch,
+                              wuffs_base__rect_ie_u32 r) {
+    if (r.min_incl_x >= cw || r.min_incl_y >= ch) return;
+    uint32_t x0 = r.min_incl_x;
+    uint32_t y0 = r.min_incl_y;
+    uint32_t x1 = r.max_excl_x > cw ? cw : r.max_excl_x;
+    uint32_t y1 = r.max_excl_y > ch ? ch : r.max_excl_y;
+    if (x1 <= x0 || y1 <= y0) return;
+    size_t stride = (size_t)cw * 4u;
+    size_t row_bytes = (size_t)(x1 - x0) * 4u;
+    for (uint32_t y = y0; y < y1; y++) {
+        memset(canvas + y * stride + x0 * 4u, 0, row_bytes);
+    }
+}
+
+/* Copy a sub-rectangle from a same-sized backup. Clips silently. */
+static void canvas_restore_rect(uint8_t* canvas, const uint8_t* backup,
+                                uint32_t cw, uint32_t ch,
+                                wuffs_base__rect_ie_u32 r) {
+    if (r.min_incl_x >= cw || r.min_incl_y >= ch) return;
+    uint32_t x0 = r.min_incl_x;
+    uint32_t y0 = r.min_incl_y;
+    uint32_t x1 = r.max_excl_x > cw ? cw : r.max_excl_x;
+    uint32_t y1 = r.max_excl_y > ch ? ch : r.max_excl_y;
+    if (x1 <= x0 || y1 <= y0) return;
+    size_t stride = (size_t)cw * 4u;
+    size_t row_bytes = (size_t)(x1 - x0) * 4u;
+    for (uint32_t y = y0; y < y1; y++) {
+        memcpy(canvas + y * stride + x0 * 4u,
+               backup + y * stride + x0 * 4u,
+               row_bytes);
+    }
+}
+
+struct tcw_decoder {
+    wuffs_base__image_decoder* dec;
+    int32_t   fourcc;
+    uint8_t*  bytes;          /* owned copy of source */
+    size_t    bytes_len;
+    wuffs_base__io_buffer    src;
+    wuffs_base__image_config cfg;
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  loop_count;
+    uint8_t*  canvas;         /* width*height*4, composed in place */
+    size_t    canvas_len;
+    uint8_t*  workbuf;
+    size_t    workbuf_len;
+    uint8_t*  backup;         /* lazy alloc for RESTORE_PREVIOUS */
+    wuffs_base__rect_ie_u32   prev_bounds;
+    uint8_t   prev_disposal;
+    uint8_t   ended;
+};
+
+int tcw_decoder_open(const uint8_t* bytes, size_t len,
+                     tcw_decoder** out, tcw_err* err) {
+    clear_err(err);
+    *out = NULL;
+
+    if (!bytes || len == 0) {
+        set_err(err, TCW_ERR_INVALID_INPUT, "empty input");
+        return TCW_ERR_INVALID_INPUT;
+    }
+    int32_t fourcc = sniff_fourcc(bytes, len);
+    if (fourcc == 0) {
+        set_err(err, TCW_ERR_UNSUPPORTED_FMT, "unrecognized image format");
+        return TCW_ERR_UNSUPPORTED_FMT;
+    }
+
+    tcw_decoder* d = (tcw_decoder*)calloc(1, sizeof(*d));
+    if (!d) {
+        set_err(err, TCW_ERR_OOM, "alloc decoder handle");
+        return TCW_ERR_OOM;
+    }
+
+    /* Own a copy; the io_buffer references these bytes across many calls. */
+    d->bytes = (uint8_t*)malloc(len);
+    if (!d->bytes) {
+        free(d);
+        set_err(err, TCW_ERR_OOM, "alloc source-bytes copy");
+        return TCW_ERR_OOM;
+    }
+    memcpy(d->bytes, bytes, len);
+    d->bytes_len = len;
+    d->fourcc = fourcc;
+
+    d->dec = alloc_decoder(fourcc, err);
+    if (!d->dec) {
+        free(d->bytes); free(d);
+        return err ? err->code : TCW_ERR_DECODE;
+    }
+
+    d->src = wuffs_base__ptr_u8__reader(d->bytes, d->bytes_len, /*closed=*/true);
+
+    wuffs_base__status st = wuffs_base__image_decoder__decode_image_config(
+        d->dec, &d->cfg, &d->src);
+    if (st.repr) {
+        set_err(err, TCW_ERR_DECODE, "decode_image_config: %s", st.repr);
+        tcw_decoder_close(d);
+        return TCW_ERR_DECODE;
+    }
+
+    d->width  = wuffs_base__pixel_config__width(&d->cfg.pixcfg);
+    d->height = wuffs_base__pixel_config__height(&d->cfg.pixcfg);
+    if (d->width == 0 || d->height == 0) {
+        set_err(err, TCW_ERR_DECODE, "zero-sized image");
+        tcw_decoder_close(d);
+        return TCW_ERR_DECODE;
+    }
+    if (d->width > TCW_MAX_DIMENSION || d->height > TCW_MAX_DIMENSION) {
+        set_err(err, TCW_ERR_TOO_LARGE,
+                "image %ux%u exceeds max dimension %d",
+                d->width, d->height, TCW_MAX_DIMENSION);
+        tcw_decoder_close(d);
+        return TCW_ERR_TOO_LARGE;
+    }
+    wuffs_base__pixel_config__set(&d->cfg.pixcfg,
+        WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL,
+        WUFFS_BASE__PIXEL_SUBSAMPLING__NONE, d->width, d->height);
+
+    d->canvas_len = (size_t)d->width * (size_t)d->height * 4u;
+    d->canvas = (uint8_t*)calloc(1, d->canvas_len);
+    if (!d->canvas) {
+        set_err(err, TCW_ERR_OOM, "alloc canvas %zu bytes", d->canvas_len);
+        tcw_decoder_close(d);
+        return TCW_ERR_OOM;
+    }
+
+    uint64_t wbl = wuffs_base__image_decoder__workbuf_len(d->dec).max_incl;
+    if (wbl > (uint64_t)SIZE_MAX) {
+        set_err(err, TCW_ERR_OOM, "workbuf too large");
+        tcw_decoder_close(d);
+        return TCW_ERR_OOM;
+    }
+    d->workbuf_len = (size_t)wbl;
+    if (d->workbuf_len > 0) {
+        d->workbuf = (uint8_t*)malloc(d->workbuf_len);
+        if (!d->workbuf) {
+            set_err(err, TCW_ERR_OOM, "alloc workbuf");
+            tcw_decoder_close(d);
+            return TCW_ERR_OOM;
+        }
+    }
+
+    d->prev_disposal     = WUFFS_BASE__ANIMATION_DISPOSAL__NONE;
+    d->loop_count        = wuffs_base__image_decoder__num_animation_loops(d->dec);
+
+    *out = d;
+    return TCW_OK;
+}
+
+uint32_t tcw_decoder_width(const tcw_decoder* d)      { return d ? d->width      : 0; }
+uint32_t tcw_decoder_height(const tcw_decoder* d)     { return d ? d->height     : 0; }
+uint32_t tcw_decoder_loop_count(const tcw_decoder* d) { return d ? d->loop_count : 0; }
+
+int tcw_decoder_next(tcw_decoder* d, const uint8_t** out_pixels,
+                     uint32_t* out_delay_ms, tcw_err* err) {
+    clear_err(err);
+    if (out_pixels)   *out_pixels   = NULL;
+    if (out_delay_ms) *out_delay_ms = 0;
+    if (!d) {
+        set_err(err, TCW_ERR_INVALID_INPUT, "null decoder");
+        return TCW_ERR_INVALID_INPUT;
+    }
+    if (d->ended) return TCW_END;
+
+    wuffs_base__frame_config fc = {0};
+    wuffs_base__status st = wuffs_base__image_decoder__decode_frame_config(
+        d->dec, &fc, &d->src);
+    if (st.repr == wuffs_base__note__end_of_data) {
+        d->ended = 1;
+        /* GIF NETSCAPE2.0 loop count may only be known after the trailer. */
+        d->loop_count = wuffs_base__image_decoder__num_animation_loops(d->dec);
+        return TCW_END;
+    }
+    if (st.repr) {
+        set_err(err, TCW_ERR_DECODE, "decode_frame_config: %s", st.repr);
+        return TCW_ERR_DECODE;
+    }
+
+    /* Apply previous frame's disposal before drawing this one. */
+    if (d->prev_disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_BACKGROUND) {
+        canvas_clear_rect(d->canvas, d->width, d->height, d->prev_bounds);
+    } else if (d->prev_disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_PREVIOUS
+               && d->backup) {
+        canvas_restore_rect(d->canvas, d->backup, d->width, d->height,
+                            d->prev_bounds);
+    }
+
+    wuffs_base__rect_ie_u32 bounds = wuffs_base__frame_config__bounds(&fc);
+    uint8_t disposal = wuffs_base__frame_config__disposal(&fc);
+
+    if (disposal == WUFFS_BASE__ANIMATION_DISPOSAL__RESTORE_PREVIOUS) {
+        if (!d->backup) {
+            d->backup = (uint8_t*)malloc(d->canvas_len);
+            if (!d->backup) {
+                set_err(err, TCW_ERR_OOM, "alloc disposal backup");
+                return TCW_ERR_OOM;
+            }
+        }
+        memcpy(d->backup, d->canvas, d->canvas_len);
+    }
+
+    wuffs_base__pixel_buffer pixbuf = {0};
+    st = wuffs_base__pixel_buffer__set_from_slice(
+        &pixbuf, &d->cfg.pixcfg,
+        wuffs_base__make_slice_u8(d->canvas, d->canvas_len));
+    if (st.repr) {
+        set_err(err, TCW_ERR_DECODE, "pixel_buffer__set_from_slice: %s", st.repr);
+        return TCW_ERR_DECODE;
+    }
+
+    wuffs_base__pixel_blend blend =
+        wuffs_base__frame_config__overwrite_instead_of_blend(&fc)
+            ? WUFFS_BASE__PIXEL_BLEND__SRC
+            : WUFFS_BASE__PIXEL_BLEND__SRC_OVER;
+
+    st = wuffs_base__image_decoder__decode_frame(
+        d->dec, &pixbuf, &d->src, blend,
+        wuffs_base__make_slice_u8(d->workbuf, d->workbuf_len), NULL);
+    if (st.repr) {
+        set_err(err, TCW_ERR_DECODE, "decode_frame: %s", st.repr);
+        return TCW_ERR_DECODE;
+    }
+
+    d->prev_disposal = disposal;
+    d->prev_bounds   = bounds;
+
+    if (out_pixels)   *out_pixels   = d->canvas;
+    if (out_delay_ms) *out_delay_ms = flicks_to_ms_clamped(
+        wuffs_base__frame_config__duration(&fc));
+    return TCW_OK;
+}
+
+int tcw_decoder_restart(tcw_decoder* d, tcw_err* err) {
+    clear_err(err);
+    if (!d) {
+        set_err(err, TCW_ERR_INVALID_INPUT, "null decoder");
+        return TCW_ERR_INVALID_INPUT;
+    }
+    /* Reinit instead of restart_frame(): the latter wants an io_position
+     * we'd have to capture separately. One alloc per restart is cheap. */
+    free(d->dec);
+    d->dec = alloc_decoder(d->fourcc, err);
+    if (!d->dec) return err ? err->code : TCW_ERR_DECODE;
+
+    d->src = wuffs_base__ptr_u8__reader(d->bytes, d->bytes_len, /*closed=*/true);
+    wuffs_base__status st = wuffs_base__image_decoder__decode_image_config(
+        d->dec, &d->cfg, &d->src);
+    if (st.repr) {
+        set_err(err, TCW_ERR_DECODE, "restart decode_image_config: %s", st.repr);
+        return TCW_ERR_DECODE;
+    }
+    wuffs_base__pixel_config__set(&d->cfg.pixcfg,
+        WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL,
+        WUFFS_BASE__PIXEL_SUBSAMPLING__NONE, d->width, d->height);
+
+    memset(d->canvas, 0, d->canvas_len);
+    d->prev_disposal = WUFFS_BASE__ANIMATION_DISPOSAL__NONE;
+    memset(&d->prev_bounds, 0, sizeof(d->prev_bounds));
+    d->ended = 0;
+    return TCW_OK;
+}
+
+void tcw_decoder_close(tcw_decoder* d) {
+    if (!d) return;
+    free(d->dec);
+    free(d->bytes);
+    free(d->canvas);
+    free(d->workbuf);
+    free(d->backup);
+    free(d);
+}
+
 /* public: encode PNG via stb_image_write */
 
 typedef struct {
