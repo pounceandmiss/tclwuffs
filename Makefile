@@ -2,7 +2,6 @@
 #
 # Standalone build:           make
 # Zippy/embedded build:       set TCL_INCLUDE, TCL_STUB_LIB, TK_INCLUDE, TK_STUB_LIB
-# Rebuild from clean vendor:  make clean && make deps && make
 # Run smoke tests:            make smoke && make test
 
 VERSION   := 0.1.0
@@ -91,7 +90,7 @@ LIB_TK_A   := libtkwuffs$(VERSION).a
 PKGINDEX   := pkgIndex.tcl
 
 # ---- Phony targets --------------------------------------------------------
-.PHONY: all tclwuffs tkwuffs smoke test test-tcl test-tk clean clean-vendor config deps install
+.PHONY: all tclwuffs tkwuffs smoke test test-tcl test-tk clean config install
 
 ifeq ($(HAVE_TK),1)
 all: tclwuffs tkwuffs $(PKGINDEX)
@@ -171,47 +170,14 @@ test-tk: $(LIB_TK_SO) $(PKGINDEX)
 	wish9.0 tests/test_tkwuffs.tcl
 	wish9.0 tests/test_tk_formats.tcl
 
-# ---- Vendor source download (pinned commits, sha256-verified) -------------
-# google/wuffs @ 3f03a885b4aedf236fa52e8cb94baf3fa2ef9a24 (2026-05-18)
-WUFFS_COMMIT      := 3f03a885b4aedf236fa52e8cb94baf3fa2ef9a24
-WUFFS_URL         := https://raw.githubusercontent.com/google/wuffs/$(WUFFS_COMMIT)/release/c/wuffs-v0.4.c
-WUFFS_SHA256      := 51d2f73b757adfab105386fd3641aebd69dabc3a19126d5e060b6996ede94714
-
-# nothings/stb @ 904aa67e1e2d1dec92959df63e700b166d5c1022
-STB_COMMIT        := 904aa67e1e2d1dec92959df63e700b166d5c1022
-STB_RESIZE_URL    := https://raw.githubusercontent.com/nothings/stb/$(STB_COMMIT)/stb_image_resize2.h
-STB_RESIZE_SHA256 := 173e654634f6ccaad98f603e686ea212eec1fe8ea6d2a5e5e8056efa10ae3880
-STB_WRITE_URL     := https://raw.githubusercontent.com/nothings/stb/$(STB_COMMIT)/stb_image_write.h
-STB_WRITE_SHA256  := cbd5f0ad7a9cf4468affb36354a1d2338034f2c12473cf1a8e32053cb6914a05
-
-VENDOR_FILES := vendor/wuffs-v0.4.c vendor/stb_image_resize2.h vendor/stb_image_write.h
-
-deps: $(VENDOR_FILES)
-
-vendor:
-	mkdir -p vendor
-
-vendor/wuffs-v0.4.c: | vendor
-	curl -fsSL -o $@.tmp $(WUFFS_URL)
-	echo "$(WUFFS_SHA256)  $@.tmp" | sha256sum -c -
-	mv $@.tmp $@
-
-vendor/stb_image_resize2.h: | vendor
-	curl -fsSL -o $@.tmp $(STB_RESIZE_URL)
-	echo "$(STB_RESIZE_SHA256)  $@.tmp" | sha256sum -c -
-	mv $@.tmp $@
-
-vendor/stb_image_write.h: | vendor
-	curl -fsSL -o $@.tmp $(STB_WRITE_URL)
-	echo "$(STB_WRITE_SHA256)  $@.tmp" | sha256sum -c -
-	mv $@.tmp $@
+# ---- Vendored sources ----------------------------------------------------
+# vendor/ is committed; refresh manually when bumping pins.
+# google/wuffs:  https://github.com/google/wuffs @ 3f03a885b4aedf236fa52e8cb94baf3fa2ef9a24
+# nothings/stb: https://github.com/nothings/stb  @ 904aa67e1e2d1dec92959df63e700b166d5c1022
 
 # ---- Housekeeping ---------------------------------------------------------
 clean:
 	rm -rf build $(LIB_TCL_SO) $(LIB_TCL_A) $(LIB_TK_SO) $(LIB_TK_A) $(PKGINDEX)
-
-clean-vendor:
-	rm -f $(VENDOR_FILES)
 
 config:
 	@echo "VERSION:      $(VERSION)"
